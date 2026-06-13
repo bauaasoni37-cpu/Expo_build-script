@@ -1,0 +1,117 @@
+#!/bin/sh
+# expo_build - Dynamic self-contained build runner for Expo / React Native on Termux AArch64
+# Combines all fixes (hermesc wrapper & Gradle init script) into one single script.
+
+# 1. Ensure ANDROID_HOME is set (Termux default path if not already in env)
+if [ -z "$ANDROID_HOME" ]; then
+    export ANDROID_HOME="/data/data/com.termux/files/usr/opt/android-sdk"
+fi
+
+# 2. Check if we are inside a react-native project
+if [ ! -d "android" ]; then
+    if [ -d "../android" ]; then
+        cd ..
+    else
+        echo "Error: Please run this command inside your React Native / Expo project directory (or its 'android' folder)." >&2
+        exit 1
+    fi
+fi
+
+# 3. Create a temporary directory for build hook scripts
+TEMP_DIR=$(mktemp -d -t expo_build_XXXXXX)
+if [ ! -d "$TEMP_DIR" ]; then
+    echo "Error: Failed to create temporary directory for build hooks." >&2
+    exit 1
+fi
+
+# Ensure cleanup on script exit
+trap 'rm -rf "$TEMP_DIR"' EXIT INT TERM
+
+# 4. Create the temporary hermesc wrapper
+cat << 'EOF' > "$TEMP_DIR/hermesc"
+#!/bin/sh
+# Temporary hermesc wrapper for Termux aarch64
+DIR="$PWD"
+while [ "$DIR" != "/" ] && [ -n "$DIR" ]; do
+    TARGET="$DIR/node_modules/hermes-compiler/hermesc/linux64-bin/hermesc"
+    if [ -f "$TARGET" ]; then
+        if head -n 1 "$TARGET" | grep -q "ELF"; then
+            exec qemu-x86_64 "$TARGET" "$@"
+        elif [ -f "${TARGET}.real" ]; then
+            exec qemu-x86_64 "${TARGET}.real" "$@"
+        fi
+    fi
+    DIR="$(dirname "$DIR")"
+done
+
+DIR="$PWD"
+while [ "$DIR" != "/" ] && [ -n "$DIR" ]; do
+    TARGET="$DIR/node_modules/react-native/sdks/hermesc/linux64-bin/hermesc"
+    if [ -f "$TARGET" ]; then
+        if head -n 1 "$TARGET" | grep -q "ELF"; then
+            exec qemu-x86_64 "$TARGET" "$@"
+        elif [ -f "${TARGET}.real" ]; then
+            exec qemu-x86_64 "${TARGET}.real" "$@"
+        fi
+    fi
+    DIR="$(dirname "$DIR")"
+done
+
+echo "Error: hermesc binary not found in node_modules traversal" >&2
+exit 1
+EOF
+chmod +x "$TEMP_DIR/hermesc"
+
+# 5. Create the temporary Gradle init script pointing to the wrapper
+cat << EOF > "$TEMP_DIR/init.gradle"
+gradle.projectsLoaded {
+    rootProject.allprojects { project ->
+        project.plugins.withId("com.facebook.react") {
+            project.logger.lifecycle("[Termux-Hermes-Fix] Configuring dynamic hermesCommand wrapper for project: \${project.name}")
+            project.react {
+                hermesCommand = "$TEMP_DIR/hermesc"
+            }
+            project.afterEvaluate {
+                project.react {
+                    hermesCommand = "$TEMP_DIR/hermesc"
+                }
+            }
+        }
+    }
+}
+EOF
+
+# 6. Determine build target tasks
+if [ $# -eq 0 ]; then
+    BUILD_TASKS="assembleRelease"
+else
+    BUILD_TASKS="$@"
+fi
+
+# 7. Run Gradle build using the dynamic init script
+echo "============================================================"
+echo " Starting Expo Android Build (Termux AArch64 Fix)..."
+echo "============================================================"
+cd android
+./gradlew -I "$TEMP_DIR/init.gradle" $BUILD_TASKS
+
+BUILD_RESULT=$?
+if [ $BUILD_RESULT -eq 0 ]; then
+    echo ""
+    echo "============================================================"
+    echo " 🎉 BUILD SUCCESSFUL!"
+    # Check if we built assembleRelease, and print location
+    if echo "$BUILD_TASKS" | grep -q "assembleRelease"; then
+        echo " APK Location: android/app/build/outputs/apk/release/app-release.apk"
+    elif echo "$BUILD_TASKS" | grep -q "assembleDebug"; then
+        echo " APK Location: android/app/build/outputs/apk/debug/app-debug.apk"
+    fi
+    echo "============================================================"
+else
+    echo ""
+    echo "============================================================"
+    echo " ❌ BUILD FAILED!"
+    echo "============================================================"
+fi
+
+exit $BUILD_RESULT
