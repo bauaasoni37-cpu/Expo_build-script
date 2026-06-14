@@ -1,0 +1,234 @@
+#!/data/data/com.termux/files/usr/bin/env bash
+
+# ==============================================================================
+# Expo/React Native Release Build & Installer Automation for Termux (expo_release)
+# Automatically configures the entire development environment (Node, QEMU, SDK, JDK)
+# on first run. If run outside a project, it automatically creates a 'myexpo'
+# project, configures Hermes, and builds its Release APK.
+# ==============================================================================
+
+set -e
+
+echo "=== Expo/React Native Release Build Automation ==="
+
+# 1. Install Node, QEMU, JDK & Android SDK if missing
+echo "Checking dependencies..."
+DEPS_MISSING=false
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js is missing."
+  DEPS_MISSING=true
+fi
+if ! command -v qemu-x86_64 >/dev/null 2>&1; then
+  echo "QEMU user-mode x86_64 is missing."
+  DEPS_MISSING=true
+fi
+if [ ! -d "/data/data/com.termux/files/usr/lib/jvm" ] && [ -z "$JAVA_HOME" ]; then
+  echo "JDK is missing."
+  DEPS_MISSING=true
+fi
+if [ ! -d "/data/data/com.termux/files/usr/opt/android-sdk" ]; then
+  echo "Android SDK is missing."
+  DEPS_MISSING=true
+fi
+
+if [ "$DEPS_MISSING" = true ]; then
+  echo "Installing required dependencies (nodejs, qemu-user-x86-64, openjdk-17, android-sdk)..."
+  if ! command -v curl >/dev/null 2>&1; then
+    pkg install -y curl
+  fi
+  if [ ! -f "/data/data/com.termux/files/usr/etc/apt/sources.list.d/termuxvoid.list" ]; then
+    echo "Adding TermuxVoid repository..."
+    curl -sL https://github.com/termuxvoid/repo/raw/main/install.sh | bash
+  fi
+  pkg update -y
+  pkg install -y nodejs qemu-user-x86-64 openjdk-17 android-sdk
+  echo "Dependencies installed successfully!"
+fi
+
+# 2. Detect and set JAVA_HOME
+echo "Detecting JDK installation..."
+JAVA_FOUND=false
+if [ -d "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk" ]; then
+  export JAVA_HOME="/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk"
+  JAVA_FOUND=true
+elif [ -d "/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk" ]; then
+  export JAVA_HOME="/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk"
+  JAVA_FOUND=true
+else
+  # Search for any installed OpenJDK
+  JVM_DIR=$(find /data/data/com.termux/files/usr/lib/jvm -maxdepth 1 -name "*openjdk*" 2>/dev/null | head -n 1 || true)
+  if [ -n "$JVM_DIR" ]; then
+    export JAVA_HOME="$JVM_DIR"
+    JAVA_FOUND=true
+  fi
+fi
+if [ "$JAVA_FOUND" = false ]; then
+  echo "Warning: JAVA_HOME could not be set automatically. Defaulting to system java path."
+else
+  echo "Using JAVA_HOME: $JAVA_HOME"
+fi
+
+# 3. Configure Android SDK layout for Termux
+USER_SDK="$HOME/.android-sdk-flutter"
+SYSTEM_SDK="/data/data/com.termux/files/usr/opt/android-sdk"
+
+if [ -d "$SYSTEM_SDK" ]; then
+  if [ ! -d "$USER_SDK/cmdline-tools/latest" ]; then
+    echo "Configuring custom Android SDK layout at $USER_SDK..."
+    mkdir -p "$USER_SDK/cmdline-tools/latest"
+    for d in build-tools cmake licenses ndk platform-tools platforms; do
+      if [ -d "$SYSTEM_SDK/$d" ]; then
+        ln -sf "$SYSTEM_SDK/$d" "$USER_SDK/$d"
+      fi
+    done
+    if [ -d "$SYSTEM_SDK/cmdline-tools/bin" ]; then
+      cp -r "$SYSTEM_SDK/cmdline-tools/bin" "$USER_SDK/cmdline-tools/latest/bin"
+      if command -v termux-fix-shebang >/dev/null 2>&1; then
+        termux-fix-shebang "$USER_SDK/cmdline-tools/latest/bin/"*
+      fi
+    fi
+    if [ -d "$SYSTEM_SDK/cmdline-tools/lib" ]; then
+      ln -sf "$SYSTEM_SDK/cmdline-tools/lib" "$USER_SDK/cmdline-tools/latest/lib"
+    fi
+    if [ -f "$SYSTEM_SDK/cmdline-tools/source.properties" ]; then
+      ln -sf "$SYSTEM_SDK/cmdline-tools/source.properties" "$USER_SDK/cmdline-tools/latest/source.properties"
+    fi
+  fi
+  export ANDROID_HOME="$USER_SDK"
+  export ANDROID_SDK_ROOT="$USER_SDK"
+else
+  echo "Error: Android SDK not found at $SYSTEM_SDK."
+  exit 1
+fi
+
+# 4. Check if we are inside a React Native/Expo project, if not create 'myexpo'
+if [ ! -d "android" ]; then
+  if [ -d "../android" ]; then
+    cd ..
+  else
+    echo "You are not inside a React Native/Expo project."
+    if [ -d "myexpo" ] && [ -d "myexpo/android" ]; then
+      echo "Found existing 'myexpo' directory. Moving into it..."
+      cd myexpo
+    else
+      echo "Creating a new default Expo project 'myexpo'..."
+      npx -y create-expo-app@latest myexpo --template blank --no-install
+      cd myexpo
+      echo "Installing npm dependencies..."
+      npm install --legacy-peer-deps
+      echo "Generating Android native folder using Expo prebuild..."
+      npx expo prebuild --platform android --no-install
+    fi
+  fi
+fi
+
+# 5. Create a temporary directory for Hermes build hook scripts
+TEMP_DIR=$(mktemp -d -t expo_build_XXXXXX)
+trap 'rm -rf "$TEMP_DIR"' EXIT INT TERM
+
+# 6. Create the temporary hermesc wrapper
+cat << 'EOF' > "$TEMP_DIR/hermesc"
+#!/bin/sh
+# Temporary hermesc wrapper for Termux aarch64
+DIR="$PWD"
+while [ "$DIR" != "/" ] && [ -n "$DIR" ]; do
+    TARGET="$DIR/node_modules/hermes-compiler/hermesc/linux64-bin/hermesc"
+    if [ -f "$TARGET" ]; then
+        if head -n 1 "$TARGET" | grep -q "ELF"; then
+            exec qemu-x86_64 "$TARGET" "$@"
+        elif [ -f "${TARGET}.real" ]; then
+            exec qemu-x86_64 "${TARGET}.real" "$@"
+        fi
+    fi
+    DIR="$(dirname "$DIR")"
+done
+
+DIR="$PWD"
+while [ "$DIR" != "/" ] && [ -n "$DIR" ]; do
+    TARGET="$DIR/node_modules/react-native/sdks/hermesc/linux64-bin/hermesc"
+    if [ -f "$TARGET" ]; then
+        if head -n 1 "$TARGET" | grep -q "ELF"; then
+            exec qemu-x86_64 "$TARGET" "$@"
+        elif [ -f "${TARGET}.real" ]; then
+            exec qemu-x86_64 "${TARGET}.real" "$@"
+        fi
+    fi
+    DIR="$(dirname "$DIR")"
+done
+
+echo "Error: hermesc binary not found in node_modules traversal" >&2
+exit 1
+EOF
+chmod +x "$TEMP_DIR/hermesc"
+
+# 7. Create the temporary Gradle init script pointing to the wrapper
+cat << EOF > "$TEMP_DIR/init.gradle"
+gradle.projectsLoaded {
+    rootProject.allprojects { project ->
+        project.plugins.withId("com.facebook.react") {
+            project.logger.lifecycle("[Termux-Hermes-Fix] Configuring dynamic hermesCommand wrapper for project: \${project.name}")
+            project.react {
+                hermesCommand = "$TEMP_DIR/hermesc"
+            }
+            project.afterEvaluate {
+                project.react {
+                    hermesCommand = "$TEMP_DIR/hermesc"
+                }
+            }
+        }
+    }
+}
+EOF
+
+# 8. Fix the gradle wrapper shebang if needed (Termux requires local shebang format)
+if [ -f "android/gradlew" ]; then
+  echo "Checking gradle wrapper shebang..."
+  if grep -q "/usr/bin/env" "android/gradlew" 2>/dev/null; then
+    echo "Fixing shebang in android/gradlew..."
+    if command -v termux-fix-shebang >/dev/null 2>&1; then
+      termux-fix-shebang android/gradlew
+    fi
+  fi
+  chmod +x android/gradlew
+fi
+
+# 9. Determine build target tasks (Only Release APK)
+BUILD_TASKS="assembleRelease"
+
+# 10. Run Gradle build using the dynamic init script
+echo "============================================================"
+echo " Starting Expo Android Build (Release Mode)..."
+echo "============================================================"
+cd android
+./gradlew -I "$TEMP_DIR/init.gradle" $BUILD_TASKS
+
+BUILD_RESULT=$?
+cd ..
+
+if [ $BUILD_RESULT -eq 0 ]; then
+    echo ""
+    echo "============================================================"
+    echo " 🎉 BUILD SUCCESSFUL!"
+    echo " APK Location: android/app/build/outputs/apk/release/app-release.apk"
+    echo "============================================================"
+    
+    # 11. Self-install globally upon successful build
+    SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0")
+    GLOBAL_PATH="/data/data/com.termux/files/usr/bin/expo_release"
+    
+    echo "Making script globally executable..."
+    if [ "$SCRIPT_PATH" != "$GLOBAL_PATH" ]; then
+        cp "$SCRIPT_PATH" "$GLOBAL_PATH"
+        chmod +x "$GLOBAL_PATH"
+        echo "Script successfully installed globally at $GLOBAL_PATH!"
+        echo "You can now run it from anywhere using the 'expo_release' command."
+    fi
+else
+    echo ""
+    echo "============================================================"
+    echo " ❌ BUILD FAILED!"
+    echo "============================================================"
+fi
+
+exit $BUILD_RESULT

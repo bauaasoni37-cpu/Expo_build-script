@@ -1,0 +1,395 @@
+#!/data/data/com.termux/files/usr/bin/env bash
+
+# ==============================================================================
+# Kotlin/Android Native Build & Project Generator for Termux (kotlin)
+# Setup Kotlin Android projects compatible with Android Studio & AndroidIDE,
+# automatically configures JDK, Android SDK, and Gradle.
+# Supports Debug/Release APKs and Android App Bundles (AAB).
+# ==============================================================================
+
+set -e
+
+# Helper: Print usage instructions
+print_usage() {
+  echo "Usage:"
+  echo "  kotlin create <app_name> [package_name]  - Create a new Android Kotlin project"
+  echo "  kotlin                                    - Build debug APK (runs assembleDebug)"
+  echo "  kotlin debug                              - Build debug APK (runs assembleDebug)"
+  echo "  kotlin release                            - Build release APK (runs assembleRelease)"
+  echo "  kotlin aab                                - Build Android App Bundle (runs bundleRelease)"
+}
+
+# 1. Install Java, Android SDK, and Gradle if missing
+echo "Checking dependencies..."
+DEPS_MISSING=false
+
+if ! command -v gradle >/dev/null 2>&1; then
+  echo "Gradle is missing."
+  DEPS_MISSING=true
+fi
+if [ ! -d "/data/data/com.termux/files/usr/lib/jvm" ] && [ -z "$JAVA_HOME" ]; then
+  echo "JDK is missing."
+  DEPS_MISSING=true
+fi
+if [ ! -d "/data/data/com.termux/files/usr/opt/android-sdk" ]; then
+  echo "Android SDK is missing."
+  DEPS_MISSING=true
+fi
+
+if [ "$DEPS_MISSING" = true ]; then
+  echo "Installing required dependencies (gradle, openjdk-17, android-sdk)..."
+  if ! command -v curl >/dev/null 2>&1; then
+    pkg install -y curl
+  fi
+  if [ ! -f "/data/data/com.termux/files/usr/etc/apt/sources.list.d/termuxvoid.list" ]; then
+    echo "Adding TermuxVoid repository..."
+    curl -sL https://github.com/termuxvoid/repo/raw/main/install.sh | bash
+  fi
+  pkg update -y
+  pkg install -y gradle openjdk-17 android-sdk
+  echo "Dependencies installed successfully!"
+fi
+
+# 2. Detect and set JAVA_HOME
+echo "Detecting JDK installation..."
+JAVA_FOUND=false
+if [ -d "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk" ]; then
+  export JAVA_HOME="/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk"
+  JAVA_FOUND=true
+elif [ -d "/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk" ]; then
+  export JAVA_HOME="/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk"
+  JAVA_FOUND=true
+else
+  JVM_DIR=$(find /data/data/com.termux/files/usr/lib/jvm -maxdepth 1 -name "*openjdk*" 2>/dev/null | head -n 1 || true)
+  if [ -n "$JVM_DIR" ]; then
+    export JAVA_HOME="$JVM_DIR"
+    JAVA_FOUND=true
+  fi
+fi
+if [ "$JAVA_FOUND" = true ]; then
+  echo "Using JAVA_HOME: $JAVA_HOME"
+fi
+
+# 3. Configure Android SDK layout for Termux
+USER_SDK="$HOME/.android-sdk-flutter"
+SYSTEM_SDK="/data/data/com.termux/files/usr/opt/android-sdk"
+
+if [ -d "$SYSTEM_SDK" ]; then
+  if [ ! -d "$USER_SDK/cmdline-tools/latest" ]; then
+    echo "Configuring custom Android SDK layout..."
+    mkdir -p "$USER_SDK/cmdline-tools/latest"
+    for d in build-tools cmake licenses ndk platform-tools platforms; do
+      if [ -d "$SYSTEM_SDK/$d" ]; then
+        ln -sf "$SYSTEM_SDK/$d" "$USER_SDK/$d"
+      fi
+    done
+    if [ -d "$SYSTEM_SDK/cmdline-tools/bin" ]; then
+      cp -r "$SYSTEM_SDK/cmdline-tools/bin" "$USER_SDK/cmdline-tools/latest/bin"
+      if command -v termux-fix-shebang >/dev/null 2>&1; then
+        termux-fix-shebang "$USER_SDK/cmdline-tools/latest/bin/"*
+      fi
+    fi
+    if [ -d "$SYSTEM_SDK/cmdline-tools/lib" ]; then
+      ln -sf "$SYSTEM_SDK/cmdline-tools/lib" "$USER_SDK/cmdline-tools/latest/lib"
+    fi
+    if [ -f "$SYSTEM_SDK/cmdline-tools/source.properties" ]; then
+      ln -sf "$SYSTEM_SDK/cmdline-tools/source.properties" "$USER_SDK/cmdline-tools/latest/source.properties"
+    fi
+  fi
+  export ANDROID_HOME="$USER_SDK"
+  export ANDROID_SDK_ROOT="$USER_SDK"
+else
+  echo "Error: Android SDK not found."
+  exit 1
+fi
+
+# 4. Handle project creation vs project compilation
+CREATE_MODE=false
+if [ "$1" = "create" ]; then
+  if [ -z "$2" ]; then
+    echo "Error: Please specify the app name."
+    print_usage
+    exit 1
+  fi
+  
+  APP_NAME="$2"
+  PKG_NAME="${3:-com.example.$APP_NAME}"
+  PKG_PATH=$(echo "$PKG_NAME" | tr '.' '/')
+  
+  echo "Creating new Kotlin Android project '$APP_NAME' with package '$PKG_NAME'..."
+  
+  # Create directory structure
+  mkdir -p "$APP_NAME/app/src/main/res/layout"
+  mkdir -p "$APP_NAME/app/src/main/res/values"
+  mkdir -p "$APP_NAME/app/src/main/res/mipmap-hdpi"
+  mkdir -p "$APP_NAME/app/src/main/java/$PKG_PATH"
+  
+  # Generate settings.gradle.kts
+  cat << EOF > "$APP_NAME/settings.gradle.kts"
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "$APP_NAME"
+include(":app")
+EOF
+
+  # Generate root build.gradle.kts
+  cat << EOF > "$APP_NAME/build.gradle.kts"
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.2.2")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22")
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+EOF
+
+  # Generate gradle.properties
+  cat << EOF > "$APP_NAME/gradle.properties"
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+android.enableJetifier=true
+kotlin.code.style=official
+EOF
+
+  # Generate app/build.gradle
+  cat << EOF > "$APP_NAME/app/build.gradle"
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+
+android {
+    namespace '$PKG_NAME'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId '$PKG_NAME'
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+}
+EOF
+
+  # Generate AndroidManifest.xml
+  cat << EOF > "$APP_NAME/app/src/main/AndroidManifest.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.App">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+EOF
+
+  # Generate colors.xml
+  cat << EOF > "$APP_NAME/app/src/main/res/values/colors.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
+EOF
+
+  # Generate strings.xml
+  cat << EOF > "$APP_NAME/app/src/main/res/values/strings.xml"
+<resources>
+    <string name="app_name">$APP_NAME</string>
+</resources>
+EOF
+
+  # Generate themes.xml
+  cat << EOF > "$APP_NAME/app/src/main/res/values/themes.xml"
+<resources>
+    <style name="Theme.App" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">@color/purple_500</item>
+        <item name="colorPrimaryVariant">@color/purple_700</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/teal_200</item>
+        <item name="colorSecondaryVariant">@color/teal_700</item>
+        <item name="colorOnSecondary">@android:color/black</item>
+    </style>
+</resources>
+EOF
+
+  # Generate activity_main.xml layout
+  cat << EOF > "$APP_NAME/app/src/main/res/layout/activity_main.xml"
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout 
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://tools.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".MainActivity">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Hello Kotlin Native in Termux!"
+        android:textSize="22sp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>
+EOF
+
+  # Generate MainActivity.kt
+  cat << EOF > "$APP_NAME/app/src/main/java/$PKG_PATH/MainActivity.kt"
+package $PKG_NAME
+
+import android.os.Bundle
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+    }
+}
+EOF
+
+  # Initialize gradle wrapper inside the new project
+  echo "Bootstrapping Gradle wrapper..."
+  cd "$APP_NAME"
+  gradle wrapper
+  
+  if [ -f "gradlew" ]; then
+    if grep -q "/usr/bin/env" "gradlew" 2>/dev/null; then
+      if command -v termux-fix-shebang >/dev/null 2>&1; then
+        termux-fix-shebang gradlew
+      fi
+    fi
+    chmod +x gradlew
+  fi
+  
+  echo "Project successfully created!"
+  CREATE_MODE=true
+else
+  # Compile existing project
+  echo "Checking if we are inside a Gradle Android project..."
+  if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
+    echo "Error: You are not inside an Android Gradle project."
+    print_usage
+    exit 1
+  fi
+  
+  # Ensure gradlew has correct shebang and is executable
+  if [ -f "gradlew" ]; then
+    if grep -q "/usr/bin/env" "gradlew" 2>/dev/null; then
+      if command -v termux-fix-shebang >/dev/null 2>&1; then
+        termux-fix-shebang gradlew
+      fi
+    fi
+    chmod +x gradlew
+  fi
+fi
+
+# Determine building task
+BUILD_TASK="assembleDebug"
+OUTPUT_DESC="Debug APK"
+OUTPUT_PATH="app/build/outputs/apk/debug/app-debug.apk"
+
+if [ "$CREATE_MODE" = false ]; then
+  if [ "$1" = "release" ]; then
+    BUILD_TASK="assembleRelease"
+    OUTPUT_DESC="Release APK"
+    OUTPUT_PATH="app/build/outputs/apk/release"
+  elif [ "$1" = "aab" ] || [ "$1" = "bundle" ]; then
+    BUILD_TASK="bundleRelease"
+    OUTPUT_DESC="Android App Bundle (AAB)"
+    OUTPUT_PATH="app/build/outputs/bundle/release"
+  elif [ "$1" = "debug" ]; then
+    BUILD_TASK="assembleDebug"
+    OUTPUT_DESC="Debug APK"
+    OUTPUT_PATH="app/build/outputs/apk/debug"
+  fi
+fi
+
+# Run build
+echo "Running compilation: ./gradlew $BUILD_TASK..."
+if [ -f "gradlew" ]; then
+  ./gradlew $BUILD_TASK
+else
+  gradle $BUILD_TASK
+fi
+
+echo "=== Build Finished successfully! ==="
+echo "Your $OUTPUT_DESC is located at:"
+echo "👉 $OUTPUT_PATH"
+
+# 5. Self-install globally upon successful build
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0")
+GLOBAL_PATH="/data/data/com.termux/files/usr/bin/kotlin"
+
+echo "Making script globally executable..."
+if [ "$SCRIPT_PATH" != "$GLOBAL_PATH" ]; then
+  cp "$SCRIPT_PATH" "$GLOBAL_PATH"
+  chmod +x "$GLOBAL_PATH"
+  echo "Script successfully installed globally at $GLOBAL_PATH!"
+  echo "You can now run it from anywhere using the 'kotlin' command."
+fi

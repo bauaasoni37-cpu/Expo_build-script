@@ -5,6 +5,7 @@
 # Automatically configures the entire development environment (TermuxVoid,
 # Flutter, Android SDK, JDK) on first run. If run outside a project, it 
 # automatically creates a 'myapp' project and builds its APK.
+# ONLY supports building Debug APKs for stability.
 # ==============================================================================
 
 set -e
@@ -149,44 +150,22 @@ if [ -f "android/gradlew" ]; then
   chmod +x android/gradlew
 fi
 
-# 7. Run Flutter build command (Defaulting to Debug APK)
+# 7. Run Flutter build command (Debug Mode ONLY)
 echo "Starting Flutter Build (Debug Mode)..."
 
-ARGS=("$@")
-if [ ${#ARGS[@]} -eq 0 ]; then
-  ARGS=("apk" "--debug" "--target-platform=android-arm64")
-else
-  # Check if they specified apk or appbundle and didn't specify --debug
-  IS_APK_OR_AAB=false
-  HAS_DEBUG=false
-  HAS_RELEASE=false
-  HAS_TARGET_PLATFORM=false
-  
-  for arg in "${ARGS[@]}"; do
-    if [ "$arg" = "apk" ] || [ "$arg" = "appbundle" ]; then
-      IS_APK_OR_AAB=true
-    fi
-    if [ "$arg" = "--debug" ]; then
-      HAS_DEBUG=true
-    fi
-    if [ "$arg" = "--release" ]; then
-      HAS_RELEASE=true
-    fi
-    if [[ "$arg" == --target-platform* ]]; then
-      HAS_TARGET_PLATFORM=true
-    fi
-  done
-  
-  if [ "$IS_APK_OR_AAB" = true ]; then
-    if [ "$HAS_DEBUG" = false ] && [ "$HAS_RELEASE" = false ]; then
-      echo "Adding default --debug flag for Termux stability."
-      ARGS+=("--debug")
-    fi
-    if [ "$HAS_TARGET_PLATFORM" = false ]; then
-      echo "Adding default --target-platform=android-arm64 for Termux compatibility."
-      ARGS+=("--target-platform=android-arm64")
-    fi
+ARGS=()
+# If arguments were passed, clean them to ensure only debug config is built
+IS_APPBUNDLE=false
+for arg in "$@"; do
+  if [ "$arg" = "appbundle" ]; then
+    IS_APPBUNDLE=true
   fi
+done
+
+if [ "$IS_APPBUNDLE" = true ]; then
+  ARGS=("appbundle" "--debug" "--target-platform=android-arm64")
+else
+  ARGS=("apk" "--debug" "--target-platform=android-arm64")
 fi
 
 flutter build "${ARGS[@]}"
