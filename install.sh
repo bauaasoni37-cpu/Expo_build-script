@@ -805,6 +805,48 @@ if [ -d "$FLUTTER_BIN_DIR" ]; then
   export PATH="$FLUTTER_BIN_DIR:$PATH"
 fi
 
+# 2.5 Auto-apply Termux environment fixes
+echo "Auto-applying Termux environment fixes..."
+
+# Fix Flutter SDK shebangs if needed
+if command -v termux-fix-shebang >/dev/null 2>&1; then
+  termux-fix-shebang "$FLUTTER_BIN_DIR/flutter" "$FLUTTER_BIN_DIR/dart" "$FLUTTER_BIN_DIR/flutter-dev" 2>/dev/null || true
+  find "$FLUTTER_BIN_DIR/internal" -type f -exec termux-fix-shebang {} + 2>/dev/null || true
+fi
+
+# Symlink native CMake and Ninja to version 3.22.1 in the Android SDK
+SDK_CMAKE_DIR="/data/data/com.termux/files/usr/opt/android-sdk/cmake"
+if [ -d "$SDK_CMAKE_DIR/4.1.2/bin" ] && [ -d "$SDK_CMAKE_DIR/3.22.1/bin" ]; then
+  if [ ! -f "$SDK_CMAKE_DIR/3.22.1/bin/cmake.bak" ] && [ -f "$SDK_CMAKE_DIR/3.22.1/bin/cmake" ]; then
+    echo "Symlinking native CMake & Ninja to SDK 3.22.1..."
+    mv "$SDK_CMAKE_DIR/3.22.1/bin/cmake" "$SDK_CMAKE_DIR/3.22.1/bin/cmake.bak" 2>/dev/null || true
+    mv "$SDK_CMAKE_DIR/3.22.1/bin/ninja" "$SDK_CMAKE_DIR/3.22.1/bin/ninja.bak" 2>/dev/null || true
+    ln -sf "$SDK_CMAKE_DIR/4.1.2/bin/cmake" "$SDK_CMAKE_DIR/3.22.1/bin/cmake"
+    ln -sf "$SDK_CMAKE_DIR/4.1.2/bin/ninja" "$SDK_CMAKE_DIR/3.22.1/bin/ninja"
+  fi
+fi
+
+# Patch Flutter SDK FlutterPluginUtils.kt to bypass NDK download checks
+UTILS_KT="/data/data/com.termux/files/usr/opt/flutter/packages/flutter_tools/gradle/src/main/kotlin/FlutterPluginUtils.kt"
+if [ -f "$UTILS_KT" ]; then
+  if grep -q "internal fun forceNdkDownload(" "$UTILS_KT" && ! grep -q "internal fun forceNdkDownload(.*) {}" "$UTILS_KT"; then
+    echo "Patching FlutterPluginUtils.kt to bypass NDK compilation checks..."
+    python3 -c '
+import pathlib, re
+p = pathlib.Path("'"$UTILS_KT"'")
+content = p.read_text()
+target_block = "internal fun forceNdkDownload"
+if target_block in content:
+    pattern = r"internal fun forceNdkDownload\([\s\S]*?\}\n\n\s+@JvmStatic\n\s+@JvmName\(\"isFlutterAppProject\"\)"
+    replacement = "internal fun forceNdkDownload(\n        gradleProject: Project,\n        flutterSdkRootPath: String\n    ) {}\n\n    @JvmStatic\n    @JvmName(\"isFlutterAppProject\")"
+    new_content, count = re.subn(pattern, replacement, content)
+    if count > 0:
+        p.write_text(new_content)
+        print("FlutterPluginUtils.kt successfully patched!")
+' 2>/dev/null || true
+  fi
+fi
+
 # 3. Check if we are in a Flutter project directory. If not, create a default 'myapp' project.
 if [ ! -f "pubspec.yaml" ] || [ ! -d "android" ]; then
   echo "You are not inside a Flutter project directory."
@@ -815,6 +857,22 @@ if [ ! -f "pubspec.yaml" ] || [ ! -d "android" ]; then
     echo "Creating a new default Flutter project 'myapp'..."
     flutter create myapp
     cd myapp
+  fi
+fi
+
+# Auto-configure project SDK versions to 34 (to bypass AAPT2 API 36 issue)
+if [ -f "android/app/build.gradle.kts" ]; then
+  if grep -q "compileSdk = flutter.compileSdkVersion" android/app/build.gradle.kts; then
+    echo "Updating android/app/build.gradle.kts to target API 34..."
+    sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 34/g' android/app/build.gradle.kts
+    sed -i 's/targetSdk = flutter.targetSdkVersion/targetSdk = 34/g' android/app/build.gradle.kts
+  fi
+fi
+if [ -f "android/app/build.gradle" ]; then
+  if grep -q "compileSdkVersion flutter.compileSdkVersion" android/app/build.gradle; then
+    echo "Updating android/app/build.gradle to target API 34..."
+    sed -i 's/compileSdkVersion flutter.compileSdkVersion/compileSdkVersion 34/g' android/app/build.gradle
+    sed -i 's/targetSdkVersion flutter.targetSdkVersion/targetSdkVersion 34/g' android/app/build.gradle
   fi
 fi
 
