@@ -1692,6 +1692,35 @@ if [ "$CREATE_MODE" = false ]; then
 fi
 
 # Run build
+# Automatically configure local.properties for standard/direct ./gradlew builds
+if [ -n "$ANDROID_HOME" ]; then
+  if [ ! -f "local.properties" ]; then
+    echo "Creating local.properties with SDK location..."
+    echo "sdk.dir=$ANDROID_HOME" > local.properties
+    echo "android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2" >> local.properties
+  else
+    if ! grep -q "sdk.dir" local.properties 2>/dev/null; then
+      echo "sdk.dir=$ANDROID_HOME" >> local.properties
+    fi
+    if ! grep -q "android.aapt2FromMavenOverride" local.properties 2>/dev/null; then
+      echo "android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2" >> local.properties
+    fi
+  fi
+fi
+
+# Automatically handle Gradle 9+ incompatibility
+if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+  GRADLE_VERSION=$(grep "distributionUrl" gradle/wrapper/gradle-wrapper.properties | sed -n 's/.*gradle-\([0-9.]*\)-.*/\1/p' || true)
+  if [ -n "$GRADLE_VERSION" ]; then
+    MAJOR_VERSION=$(echo "$GRADLE_VERSION" | cut -d. -f1)
+    if [ "$MAJOR_VERSION" -ge 9 ]; then
+      echo "Incompatible Gradle version $GRADLE_VERSION detected (Gradle 9+ is incompatible with Android Gradle Plugin 8.x)."
+      echo "Automatically adjusting Gradle wrapper to v8.4..."
+      sed -i 's/gradle-9\.[0-9.]*/gradle-8.4/g' gradle/wrapper/gradle-wrapper.properties
+    fi
+  fi
+fi
+
 # Ensure we have a compatible gradle wrapper to avoid Gradle 9+ incompatibility
 if [ ! -f "gradlew" ] && [ -n "$(command -v gradle)" ]; then
   echo "No Gradle wrapper found. Bootstrapping Gradle wrapper v8.5..."
