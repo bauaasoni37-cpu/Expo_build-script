@@ -1,0 +1,206 @@
+#!/data/data/com.termux/files/usr/bin/env bash
+
+# ==============================================================================
+# Flutter Debug Build & Installer Automation for Termux (flutter_debug)
+# Automatically configures the entire development environment (TermuxVoid,
+# Flutter, Android SDK, JDK) on first run. If run outside a project, it 
+# automatically creates a 'myapp' project and builds its APK.
+# ==============================================================================
+
+set -e
+
+echo "=== Flutter Debug Build & Installer Automation for Termux ==="
+
+# 1. Install Flutter & dependencies if missing (for fresh Termux installations)
+if ! command -v flutter >/dev/null 2>&1 && [ ! -d "/data/data/com.termux/files/usr/opt/flutter" ]; then
+  echo "Flutter is not installed. Setting up TermuxVoid repository..."
+  
+  # Ensure curl is installed
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Installing curl..."
+    pkg install -y curl
+  fi
+  
+  # Install TermuxVoid repo
+  echo "Configuring TermuxVoid repository..."
+  curl -sL https://github.com/termuxvoid/repo/raw/main/install.sh | bash
+  
+  # Update package lists
+  echo "Updating package index..."
+  pkg update -y
+  
+  # Install Flutter, Android SDK, and JDK
+  echo "Installing Flutter, Android SDK, and JDK..."
+  pkg install -y flutter android-sdk openjdk-17
+  
+  echo "Core installation complete!"
+fi
+
+# 2. Add Flutter binaries to PATH if they exist in the standard Termux location
+FLUTTER_BIN_DIR="/data/data/com.termux/files/usr/opt/flutter/bin"
+if [ -d "$FLUTTER_BIN_DIR" ]; then
+  export PATH="$FLUTTER_BIN_DIR:$PATH"
+fi
+
+# 3. Check if we are in a Flutter project directory. If not, create a default 'myapp' project.
+if [ ! -f "pubspec.yaml" ] || [ ! -d "android" ]; then
+  echo "You are not inside a Flutter project directory."
+  if [ -d "myapp" ] && [ -f "myapp/pubspec.yaml" ] && [ -d "myapp/android" ]; then
+    echo "Found existing 'myapp' directory. Moving into it..."
+    cd myapp
+  else
+    echo "Creating a new default Flutter project 'myapp'..."
+    flutter create myapp
+    cd myapp
+  fi
+fi
+
+# 4. Detect and set JAVA_HOME, fix if missing
+echo "Detecting JDK installation..."
+JAVA_FOUND=false
+if [ -d "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk" ]; then
+  export JAVA_HOME="/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk"
+  JAVA_FOUND=true
+elif [ -d "/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk" ]; then
+  export JAVA_HOME="/data/data/com.termux/files/usr/lib/jvm/java-21-openjdk"
+  JAVA_FOUND=true
+else
+  # Search for any installed OpenJDK
+  JVM_DIR=$(find /data/data/com.termux/files/usr/lib/jvm -maxdepth 1 -name "*openjdk*" 2>/dev/null | head -n 1 || true)
+  if [ -n "$JVM_DIR" ]; then
+    export JAVA_HOME="$JVM_DIR"
+    JAVA_FOUND=true
+  fi
+fi
+
+if [ "$JAVA_FOUND" = false ]; then
+  echo "Warning: No JDK installation found. Attempting to install openjdk-17..."
+  pkg install -y openjdk-17
+  export JAVA_HOME="/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk"
+fi
+
+echo "Using JAVA_HOME: $JAVA_HOME"
+
+# 5. Configure / Fix Android SDK and commandline-tools
+USER_SDK="$HOME/.android-sdk-flutter"
+SYSTEM_SDK="/data/data/com.termux/files/usr/opt/android-sdk"
+
+if [ ! -d "$SYSTEM_SDK" ]; then
+  echo "Warning: System Android SDK not found at $SYSTEM_SDK."
+  echo "Attempting to install android-sdk..."
+  pkg install -y android-sdk || true
+fi
+
+if [ -d "$SYSTEM_SDK" ]; then
+  if [ ! -d "$USER_SDK/cmdline-tools/latest" ]; then
+    echo "Setting up custom Android SDK layout at $USER_SDK..."
+    mkdir -p "$USER_SDK/cmdline-tools/latest"
+    
+    # Symlink major SDK directories
+    for d in build-tools cmake licenses ndk platform-tools platforms; do
+      if [ -d "$SYSTEM_SDK/$d" ]; then
+        ln -sf "$SYSTEM_SDK/$d" "$USER_SDK/$d"
+      fi
+    done
+    
+    # Copy cmdline-tools/bin to latest/bin and fix shebangs
+    if [ -d "$SYSTEM_SDK/cmdline-tools/bin" ]; then
+      cp -r "$SYSTEM_SDK/cmdline-tools/bin" "$USER_SDK/cmdline-tools/latest/bin"
+      if command -v termux-fix-shebang >/dev/null 2>&1; then
+        termux-fix-shebang "$USER_SDK/cmdline-tools/latest/bin/"*
+      fi
+    fi
+    
+    # Symlink remaining cmdline-tools files/dirs
+    if [ -d "$SYSTEM_SDK/cmdline-tools/lib" ]; then
+      ln -sf "$SYSTEM_SDK/cmdline-tools/lib" "$USER_SDK/cmdline-tools/latest/lib"
+    fi
+    if [ -f "$SYSTEM_SDK/cmdline-tools/source.properties" ]; then
+      ln -sf "$SYSTEM_SDK/cmdline-tools/source.properties" "$USER_SDK/cmdline-tools/latest/source.properties"
+    fi
+    
+    echo "Custom Android SDK layout configured successfully."
+  fi
+
+  export ANDROID_HOME="$USER_SDK"
+  export ANDROID_SDK_ROOT="$USER_SDK"
+  
+  # Ensure Flutter is configured to use the custom SDK layout
+  CURRENT_FLUTTER_SDK=$(flutter config --list 2>/dev/null | grep "android-sdk:" | awk '{print $2}' | tr -d '"' || true)
+  if [ "$CURRENT_FLUTTER_SDK" != "$USER_SDK" ]; then
+    echo "Updating flutter config --android-sdk to: $USER_SDK"
+    flutter config --android-sdk "$USER_SDK" >/dev/null 2>&1
+  fi
+else
+  echo "Error: Android SDK could not be configured."
+  exit 1
+fi
+
+# 6. Fix the gradle wrapper shebang if needed (Termux requires local shebang format)
+if [ -f "android/gradlew" ]; then
+  echo "Checking gradle wrapper shebang..."
+  # If it has standard /usr/bin/env, run termux-fix-shebang
+  if grep -q "/usr/bin/env" "android/gradlew" 2>/dev/null; then
+    echo "Fixing shebang in android/gradlew..."
+    if command -v termux-fix-shebang >/dev/null 2>&1; then
+      termux-fix-shebang android/gradlew
+    fi
+  fi
+  chmod +x android/gradlew
+fi
+
+# 7. Run Flutter build command (Defaulting to Debug APK)
+echo "Starting Flutter Build (Debug Mode)..."
+
+ARGS=("$@")
+if [ ${#ARGS[@]} -eq 0 ]; then
+  ARGS=("apk" "--debug" "--target-platform=android-arm64")
+else
+  # Check if they specified apk or appbundle and didn't specify --debug
+  IS_APK_OR_AAB=false
+  HAS_DEBUG=false
+  HAS_RELEASE=false
+  HAS_TARGET_PLATFORM=false
+  
+  for arg in "${ARGS[@]}"; do
+    if [ "$arg" = "apk" ] || [ "$arg" = "appbundle" ]; then
+      IS_APK_OR_AAB=true
+    fi
+    if [ "$arg" = "--debug" ]; then
+      HAS_DEBUG=true
+    fi
+    if [ "$arg" = "--release" ]; then
+      HAS_RELEASE=true
+    fi
+    if [[ "$arg" == --target-platform* ]]; then
+      HAS_TARGET_PLATFORM=true
+    fi
+  done
+  
+  if [ "$IS_APK_OR_AAB" = true ]; then
+    if [ "$HAS_DEBUG" = false ] && [ "$HAS_RELEASE" = false ]; then
+      echo "Adding default --debug flag for Termux stability."
+      ARGS+=("--debug")
+    fi
+    if [ "$HAS_TARGET_PLATFORM" = false ]; then
+      echo "Adding default --target-platform=android-arm64 for Termux compatibility."
+      ARGS+=("--target-platform=android-arm64")
+    fi
+  fi
+fi
+
+flutter build "${ARGS[@]}"
+
+echo "=== Build Finished successfully! ==="
+
+# 8. Self-install globally upon successful build
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0")
+GLOBAL_PATH="/data/data/com.termux/files/usr/bin/flutter_debug"
+
+echo "Making script globally executable..."
+if [ "$SCRIPT_PATH" != "$GLOBAL_PATH" ]; then
+  cp "$SCRIPT_PATH" "$GLOBAL_PATH"
+  chmod +x "$GLOBAL_PATH"
+  echo "Script successfully installed globally at $GLOBAL_PATH!"
+  echo "You can now run it from anywhere using the 'flutter_debug' command."
+fi
